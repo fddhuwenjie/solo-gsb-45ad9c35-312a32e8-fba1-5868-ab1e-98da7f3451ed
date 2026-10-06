@@ -62,6 +62,48 @@ class AliasConflictError(Exception):
         super().__init__(self.message)
 
 
+class WorksheetNotFoundError(Exception):
+    """按标识读取/修订可修订工作单时工作单不存在（HTTP 404）。"""
+
+    def __init__(self, worksheet_id: str) -> None:
+        self.worksheet_id = worksheet_id
+        self.message = f"可修订工作单不存在: {worksheet_id!r}"
+        super().__init__(self.message)
+
+
+class RevisionConflictError(Exception):
+    """可修订工作单的乐观修订冲突：expected_revision 与当前修订号不一致（HTTP 409）。
+
+    同一修订的并发修改最多成功一项；冲突时不修改已保存的输入、结果与修订号。
+    响应体携带服务端当前修订号 ``current_revision``，供调用方重新读取后重试。
+    """
+
+    def __init__(
+        self, worksheet_id: str, current_revision: int, expected_revision: int
+    ) -> None:
+        self.worksheet_id = worksheet_id
+        self.current_revision = current_revision
+        self.expected_revision = expected_revision
+        self.message = (
+            f"可修订工作单 {worksheet_id!r} 的当前修订号为 {current_revision}，"
+            f"与提交的 expected_revision {expected_revision} 不一致"
+        )
+        super().__init__(self.message)
+
+
+class PersistenceError(Exception):
+    """持久化（原子落盘）失败（HTTP 500）。
+
+    内存更新与写盘必须共同生效：抛出此错误前，存储层已把内存状态回滚到
+    写盘前，已保存的内容、结果与修订号保持原样；磁盘上的旧文件因采用
+    “临时文件 + 原子替换”也保持完好。
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
 def invalid_syntax(message: str) -> ConversionError:
     return ConversionError("invalid_syntax", message)
 

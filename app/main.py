@@ -18,18 +18,35 @@ from .converter import (
 )
 from .custom_units import scope_for_request
 from .diagnose import diagnose_worksheet
-from .errors import AliasConflictError, ConversionError, MigrationError, affine_mixing
+from .errors import (
+    AliasConflictError,
+    ConversionError,
+    MigrationError,
+    PersistenceError,
+    RevisionConflictError,
+    WorksheetNotFoundError,
+    affine_mixing,
+)
 from .evaluator import evaluate, make_quantity
 from .migrate import migrate_worksheet
 from .parser import ParsedExpression, canonical, canonical_dim, parse_expression
+from .revisions import (
+    create_revisable_worksheet,
+    get_worksheet_store,
+    get_revisable_worksheet,
+    revise_revisable_worksheet,
+)
 from .schemas import (
     BindUnitSetAliasRequest,
     ConvertRequest,
     ConvertResponse,
+    CreateRevisableWorksheetRequest,
     ErrorResponse,
     EvaluateRequest,
     PublishUnitSetRequest,
     PublishedUnitSetResponse,
+    RevisableWorksheetResponse,
+    ReviseWorksheetRequest,
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
@@ -51,8 +68,9 @@ from .worksheet import run_worksheet
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # 启动时加载磁盘上的已发布自定义单位定义集（容器重建后仍可使用）
+    # 启动时加载磁盘上的已发布自定义单位定义集与可修订工作单（容器重建后仍可使用）
     get_store()
+    get_worksheet_store()
     yield
 
 
@@ -72,6 +90,11 @@ app = FastAPI(
         "属性逐步对照并报告首个含义变化。"
         "/worksheet-migrate 则把现有工作单的初始变量改写为在新定义集下"
         "物理量相同的精确十进制值，返回可直接交给 /worksheet 的新工作单。"
+        "POST/GET/PATCH /revisable-worksheets 提供可反复修订、持久保存的"
+        "工作单：创建时固定实际定义集标识，整单成功后保存输入、逐步结果"
+        "与修订号；修订须带 expected_revision，整单重算成功后共同保存新"
+        "输入、新结果与递增修订号，冲突返回 409、计算失败返回 422 且不"
+        "改变已保存内容。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
         "再由四个接口凭标识选用。"
         "POST /custom-unit-set-migration/export 可一次导出 1～6 个已发布"
@@ -115,6 +138,43 @@ async def alias_conflict_error_handler(_: Request, exc: AliasConflictError) -> J
     if exc.current_id is not None:
         detail["current_id"] = exc.current_id
     return JSONResponse(status_code=409, content={"detail": detail})
+
+
+@app.exception_handler(RevisionConflictError)
+async def revision_conflict_error_handler(
+    _: Request, exc: RevisionConflictError
+) -> JSONResponse:
+    # 可修订工作单乐观修订冲突：同一修订的并发修改最多成功一项；
+    # 不改变已保存的输入、结果与修订号，响应带回服务端当前修订号供重试
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": {
+                "error": "revision_conflict",
+                "message": exc.message,
+                "current_revision": exc.current_revision,
+            }
+        },
+    )
+
+
+@app.exception_handler(WorksheetNotFoundError)
+async def worksheet_not_found_error_handler(
+    _: Request, exc: WorksheetNotFoundError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={"detail": {"error": "worksheet_not_found", "message": exc.message}},
+    )
+
+
+@app.exception_handler(PersistenceError)
+async def persistence_error_handler(_: Request, exc: PersistenceError) -> JSONResponse:
+    # 落盘失败：存储层已回滚内存状态，已保存内容、结果与修订号保持原样
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"error": "persistence_failed", "message": exc.message}},
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -411,6 +471,64 @@ def worksheet_migrate_endpoint(req: WorksheetMigrateRequest) -> WorksheetMigrate
     # 属性，显示值允许变化）。任何一处失败都返回 422 并指出变量或步骤，
     # 不返回迁移工作单；整个操作只读，不修改定义集或别名。
     return migrate_worksheet(req)
+
+
+@app.post(
+    "/revisable-worksheets",
+    response_model=RevisableWorksheetResponse,
+    response_model_exclude_none=True,
+    status_code=201,
+    responses={
+        422: {"model": ErrorResponse, "description": "定义集标识/别名不存在或工作单"
+        "任一步骤计算失败：不保存任何内容，不生成标识"}
+    },
+    summary="创建可修订工作单（整单成功后保存输入、逐步结果、固定定义集标识与修订号 1）",
+)
+def create_revisable_worksheet_endpoint(
+    req: CreateRevisableWorksheetRequest,
+) -> RevisableWorksheetResponse:
+    # 提交现有 2～5 步工作单与已发布定义集标识或活动别名：别名在请求开始
+    # 时解析一次，实际标识随工作单固定（此后别名切换不影响本工作单）。
+    # 整单计算成功后才把输入、逐步结果、实际定义集标识与初始修订号共同
+    # 保存并返回工作单标识；计算失败返回 422 且不留任何内容。
+    return create_revisable_worksheet(req)
+
+
+@app.get(
+    "/revisable-worksheets/{worksheet_id}",
+    response_model=RevisableWorksheetResponse,
+    response_model_exclude_none=True,
+    responses={404: {"description": "工作单标识不存在"}},
+    summary="按标识读取可修订工作单的当前内容、逐步结果与修订号",
+)
+def get_revisable_worksheet_endpoint(worksheet_id: str) -> RevisableWorksheetResponse:
+    # 输入与结果取自同一临界区内的同一版本：并发读取只会看到某一修订的
+    # 一致内容，不会看到“新输入 + 旧结果”的跨修订拼装。
+    return get_revisable_worksheet(worksheet_id)
+
+
+@app.patch(
+    "/revisable-worksheets/{worksheet_id}",
+    response_model=RevisableWorksheetResponse,
+    response_model_exclude_none=True,
+    responses={
+        409: {"description": "expected_revision 与当前修订号不一致（同一修订的并发"
+        "修改最多成功一项）；已保存内容不变"},
+        422: {"model": ErrorResponse, "description": "替换目标不存在/改名/步骤数变化，"
+        "或整单重算失败；已保存内容、结果与修订号均不变"},
+        404: {"description": "工作单标识不存在"},
+    },
+    summary="修订可修订工作单（替换一个初始变量或一个现有步骤，整单重算后递增修订号）",
+)
+def revise_revisable_worksheet_endpoint(
+    worksheet_id: str, req: ReviseWorksheetRequest
+) -> RevisableWorksheetResponse:
+    # 乐观并发：expected_revision 不符返回 409；一次只能替换一个现有初始
+    # 变量的值与单位，或一个现有步骤的公式/方程及目标单位（名称不变）。
+    # 修改后整张工作单用创建时固定的定义集从头完整重算（下游步骤不沿用
+    # 旧结果），成功后新输入、新逐步结果与递增修订号在同一临界区内共同
+    # 保存并原子落盘；计算失败 422、写盘失败回滚，都不改变已保存内容。
+    return revise_revisable_worksheet(worksheet_id, req)
 
 
 @app.get("/health", summary="健康检查")
