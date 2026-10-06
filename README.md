@@ -10,6 +10,8 @@
 - **变量公式求值（`POST /evaluate`）**：1～20 个带 `value`/`unit` 的变量 + 公式（变量、十进制定值、`+ - * /`、括号、整数幂），解析时以 `Fraction` 同步合并数值与量纲，结果精确换算到 `output_unit`
 - **等式求解（`POST /solve`）**：用带单位的等式反求未知量：两侧以 `Fraction` 同步构建未知量的一次系数与常数项并校验量纲，支持 `+ - * /`、括号与纯常数幂，解精确换算到线性的 `output_unit`
 - **顺序计算工作单（`POST /worksheet`）**：一次请求提交初始带单位变量与 **2～5 个步骤**，每步要么是公式求值、要么是一次线性方程反求，给出唯一结果名与目标单位；后续步骤可按结果名引用先前步骤的结果，步骤间传递**精确分数数值与绝对温度属性**，返回各步骤的 `value`/`unit`/`dimension` 供核对完整过程；任一步错误返回 **422 且不返回部分结果**
+- **可修订工作单（`POST`/`GET`/`PATCH /revisable-worksheets`）**：把一份 2～5 步工作单连同**已发布定义集标识或活动别名**创建为可反复调整的持久化工作单。整单计算成功才保存输入、逐步结果、实际使用的定义集标识与初始修订号（`revision=1`）；按标识读取当前内容、结果与修订号；修订时必须携带**预期修订号**，每次只能替换一个初始变量的值与单位、或一个现有步骤（按结果名定位、名称不变）的公式/方程及目标单位，随后**整单重算**并共同保存新输入、新逐步结果与递增修订号（下游步骤不沿用旧结果）。同一修订的并发修改最多一项成功，其余返回 **409**；计算失败返回 **422**、写盘失败回滚，二者都不改变已保存内容；别名切换后仍使用创建时固定的定义；并发读取只见同一修订的输入与结果；**容器重建后仍可读取并继续修订**
+
 - **工作单换版诊断（`POST /worksheet-diagnose`）**：一次请求提交同一份 2～5 步工作单与旧、新两份**已发布**定义集的标识或活动别名；请求开始时分别固定两侧实际指向，用各自定义各执行一遍（只读、不改定义集或别名），逐步并排返回两侧结果与**首个含义变化**。比较按 **SI 口径精确分数数值、量纲与绝对温度属性**进行，而非显示字符串——旧版 `span=2 m`、新版 `span=3 m` 时输入 `1 span` 并输出到 `span`，两侧虽都显示 `1 span` 也会报告物理值已变。某一侧第 k 步业务失败时保留此前步骤对照并回报该步错误，失败后步骤标记 `not_run` 不计成功；未知定义集/别名或非法请求返回 422
 - **工作单输入迁移（`POST /worksheet-migrate`）**：一次请求提交现有 2～5 步工作单与旧、新定义集标识或活动别名（请求开始分别固定两侧实际指向）；先在旧定义下执行，再把每个初始变量改写成**新定义下单位表达式相同、物理量（含量纲与绝对温度属性）也相同的精确十进制值**，返回可直接交给 `/worksheet` 的新工作单（引用固定的新定义集标识）。改写后整张工作单在新定义下再执行一遍，逐步核对内部精确量、量纲与绝对温度属性（显示值允许变化）；旧工作单出错、新定义下变量或步骤单位不兼容、改写值无法精确十进制表示、新工作单出错或结果含义变化时返回 **422 并指出变量或步骤**，不返回迁移工作单。操作只读，不改写定义集或别名
 - **量纲规范化**：输出规范单位表达式与 SI 基本量纲表达式，相同输入永远产生相同输出
@@ -1011,12 +1013,183 @@ curl -X POST http://localhost:8000/worksheet \
 - 旧/新引用的定义集标识或活动别名不存在、引用里 `id` 与 `alias` 同时给
   （或都不给）、步骤数不在 2～5 等请求级错误：`invalid_request`。
 
+### 可修订工作单（`POST`/`GET`/`PATCH /revisable-worksheets`）
+
+工作单往往需要反复调整输入或步骤。**可修订工作单**把一份现有 2～5 步工作单
+（结构同 `POST /worksheet` 的变量与步骤）与**一份已发布定义集**（标识或活动
+别名）一起持久化保存，并为每次成功修改保留一个自洽的整单快照：当前输入、
+全部步骤的逐步结果、实际使用的定义集标识与一个单调递增的**修订号**
+（`revision`）。
+
+核心约定：
+
+- **整单成功才保存**：创建时先用固定定义把整单执行一遍，任一步失败返回
+  **422**，不创建工作单、不写盘；
+- **创建时固定定义**：请求给 `custom_unit_set_id` 或 `custom_unit_set_alias`
+  （恰好一个）；别名在创建开始时解析一次，保存的是解析到的具体标识——此后
+  别名再切换，该工作单（及其后续修订）仍始终使用创建时的定义；
+- **修订只改一处**：每次修订只能替换**一个**初始变量的 `value` 与 `unit`
+  （变量名不变），或按**现有步骤结果名**替换该步骤的公式/方程及目标单位
+  （步骤位置与名称不变；步骤可在求值与反求两种形态间替换，仍须满足工作单
+  全部既有校验）；不能新增/删除/重命名变量或步骤；
+- **整单重算**：修订成功后从新输入开始重跑全部步骤，逐步结果全部来自本次
+  计算——下游步骤绝不会沿用旧修订的结果；
+- **乐观并发**：修订必须携带读取时的 `expected_revision`；同一修订的并发
+  修改最多一项成功，其余返回 **409**（响应带回 `current_revision`，重新读取
+  后重试即可），落选请求不执行重算；
+- **失败不留痕**：修改非法或整单重算任一步失败返回 **422**，发生在任何写入
+  之前；写盘失败回滚内存状态——两种失败都不改变已保存的输入、结果或修订号；
+- **快照一致读**：读取在同一临界区返回完整快照，并发读者不会看到
+  “新输入 + 旧结果”的混版状态；
+- **容器重建**：工作单保存在数据目录（默认 `/data`）的
+  `revisable_worksheets.json` 中（与定义集同目录、命名卷挂载方式不变），
+  容器/进程重建后仍可读取并继续修订。
+
+**第 1 步：创建（`POST /revisable-worksheets`，成功 201）**
+
+```bash
+# 先发布一份定义集（也可以直接使用既有标识；用别名同理）
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"ft","factor":"0.3048","base_unit":"m"}]}'
+# -> {"id":"cus_...", ...}
+
+curl -X POST http://localhost:8000/revisable-worksheets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {
+      "v": {"value": "60", "unit": "km/h"},
+      "t": {"value": "2",  "unit": "h"}
+    },
+    "steps": [
+      {"name": "s",  "formula": "v*t",            "output_unit": "km"},
+      {"name": "th", "equation": "v*th = s", "solve_for": "th", "output_unit": "h"}
+    ],
+    "custom_unit_set_id": "cus_..."
+  }'
+```
+
+```json
+{
+  "id": "rws_1f2e3d4c5b6a79887766554433221100",
+  "revision": 1,
+  "custom_unit_set_id": "cus_...",
+  "variables": {
+    "v": {"value": "60", "unit": "km/h"},
+    "t": {"value": "2",  "unit": "h"}
+  },
+  "steps": [
+    {"name": "s",  "formula": "v*t",           "output_unit": "km"},
+    {"name": "th", "equation": "v*th = s", "solve_for": "th", "output_unit": "h"}
+  ],
+  "results": [
+    {"name": "s",  "value": "120", "unit": "km", "dimension": "m"},
+    {"name": "th", "value": "2",   "unit": "h",  "dimension": "s"}
+  ]
+}
+```
+
+用别名创建时把 `custom_unit_set_id` 换成 `"custom_unit_set_alias": "lengths"`
+即可；响应中 `custom_unit_set_id` 是创建开始时固定下来的实际标识。引用的
+标识/别名不存在、两个引用同时给（或都不给）、或工作单任一步计算失败均为
+**422**，不创建工作单。
+
+**第 2 步：读取（`GET /revisable-worksheets/{id}`）**
+
+```bash
+curl http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a79887766554433221100
+```
+
+返回与创建成功相同的结构（当前修订的 `revision`、`variables`、`steps` 与
+同属这一修订的 `results`）；标识不存在返回 **404**。
+
+**第 3 步：修订（`PATCH /revisable-worksheets/{id}`）**
+
+请求体为 `{"expected_revision": <读取到的修订号>, "variable": ...}` 或
+`{"expected_revision": ..., "step": ...}`，二者恰好一个。成功返回修订后的
+完整结构，`revision` 递增。
+
+```bash
+# 3a) 替换一个初始变量的值与单位（变量名不变）：t: 2 h -> 3 h
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a79887766554433221100 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 1,
+    "variable": {"name": "t", "value": "3", "unit": "h"}
+  }'
+```
+
+```json
+{
+  "id": "rws_...", "revision": 2, "custom_unit_set_id": "cus_...",
+  "variables": {
+    "v": {"value": "60", "unit": "km/h"},
+    "t": {"value": "3",  "unit": "h"}
+  },
+  "steps": [
+    {"name": "s",  "formula": "v*t",           "output_unit": "km"},
+    {"name": "th", "equation": "v*th = s", "solve_for": "th", "output_unit": "h"}
+  ],
+  "results": [
+    {"name": "s",  "value": "180", "unit": "km", "dimension": "m"},
+    {"name": "th", "value": "3",   "unit": "h",  "dimension": "s"}
+  ]
+}
+```
+
+```bash
+# 3b) 替换一个现有步骤的公式与目标单位（步骤名不变）：
+#     s 的公式改为 v*t/2 并输出到 m；下游 th 按新的 s 整单重算（结果为 1 h，
+#     而非旧结果推导的 2 h）
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a79887766554433221100 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 2,
+    "step": {"name": "s", "formula": "v*t/2", "output_unit": "m"}
+  }'
+
+# 3c) 步骤也可在求值与反求两种形态间替换（名称不变，仍须满足既有校验）
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_1f2e3d4c5b6a79887766554433221100 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 3,
+    "step": {"name": "th", "equation": "v*th = s", "solve_for": "th", "output_unit": "min"}
+  }'
+```
+
+修订的错误与并发语义：
+
+| 情况 | 状态 | 已保存内容 |
+| ---- | ---- | ---------- |
+| `expected_revision` 与当前修订号不一致（同一修订的并发修改落选） | **409** `revision_conflict`（响应含 `current_revision`） | 不变 |
+| 工作单标识不存在 | **404** `worksheet_not_found` | — |
+| 变量/步骤名不存在，或试图新增/删除/重命名 | **422** `invalid_request` | 不变 |
+| 替换后步骤形态非法（公式与方程混给、反求缺 `solve_for`、方程多等号等） | **422** | 不变 |
+| 整单重算任一步失败（量纲冲突、除零、非线性、精度溢出等，错误码同 `/worksheet`） | **422** | 不变 |
+| 服务端写盘失败 | **500**（内存已回滚） | 输入、结果与修订号均不变，可按原修订号重试 |
+
+409 响应示例：
+
+```json
+{"detail": {"error": "revision_conflict",
+            "message": "工作单 'rws_...' 当前修订号为 2，提交的 expected_revision 为 1：……",
+            "current_revision": 2}}
+```
+
+调用方按 `current_revision` 重新 `GET` 最新内容、合并自己的修改后用新的
+修订号重试即可。容器重建（`docker compose up` 重建容器、命名卷保留）后，
+`GET` 仍返回最后一次成功修订，并可继续 `PATCH` 修订；既有的
+`POST /worksheet` 等所有调用与 Compose 启动方式保持不变。
+
 ### 其他端点
 
 | 端点         | 说明                             |
 | ------------ | -------------------------------- |
 | `POST /worksheet-diagnose` | 工作单换版诊断：同一 2～5 步工作单分别在旧/新已发布定义集（标识或活动别名）下执行，逐步并排对照并报告首个含义变化；业务失败结构化返回，未知定义集/非法请求 422 |
 | `POST /worksheet-migrate` | 工作单输入迁移：把现有 2～5 步工作单的初始变量改写为新定义集下物理量相同的精确十进制值，返回可直接交给 `/worksheet` 的新工作单（引用固定的新标识）；失败 422 并指出变量或步骤 |
+| `POST /revisable-worksheets` | 创建可修订工作单（201）：提交 2～5 步工作单与已发布定义集标识或活动别名，整单成功才保存输入、逐步结果、固定定义集标识与初始修订号 1，返回工作单标识；引用不存在或任一步失败 422 且不创建 |
+| `GET /revisable-worksheets/{id}` | 读取可修订工作单当前修订的输入、步骤定义、逐步结果与修订号；不存在 404 |
+| `PATCH /revisable-worksheets/{id}` | 修订可修订工作单：携带 `expected_revision`，只替换一个初始变量或一个现有步骤（名称不变），整单重算后共同保存并把修订号 +1；修订号冲突 409（带回 `current_revision`）、标识不存在 404、修改非法或重算失败 422；写盘失败回滚，均不改变已保存内容 |
 | `POST /custom-unit-sets` | 发布 1～6 项自定义单位定义为可复用定义集，返回服务生成标识（201） |
 | `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
 | `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |
@@ -1125,6 +1298,19 @@ PRIMARY:= "(" expr ")" | VARIABLE | DECIMAL
 `current_id` 为服务端当前指向（初建冲突、当前没有指向时省略该字段）。冲突时不切换、
 不落盘、不改写原指向；调用方可按 `current_id` 重新读取后决定是否重试。
 
+可修订工作单的乐观修订在 `PATCH /revisable-worksheets/{id}` 的
+`expected_revision` 与当前修订号不一致时同样返回 **HTTP 409**：
+
+```json
+{"detail": {"error": "revision_conflict",
+            "message": "工作单 'rws_...' 当前修订号为 2，提交的 expected_revision 为 1：……",
+            "current_revision": 2}}
+```
+
+同一修订的并发修改最多一项成功；落选请求不执行重算、不改变已保存的输入、
+结果或修订号，调用方可按 `current_revision` 重新读取后重试。读取/修订一个
+不存在的工作单标识返回 **HTTP 404**（`worksheet_not_found`）。
+
 ## 项目结构
 
 ```
@@ -1135,6 +1321,7 @@ app/
   evaluator.py  # 公式求值器（Fraction 数值/量纲合并、温标规则）
   solver.py     # 等式求解器（未知量一次系数/常数的 Fraction 构建与量纲校验）
   worksheet.py  # 顺序计算工作单：2～5 个求值/反求步骤顺序执行，步骤间传递精确量与绝对温度属性；另有逐步收集器（不抛业务错误）供换版诊断与输入迁移使用
+  revisions.py  # 可修订工作单：创建/读取/乐观修订（CAS）、单项目替换、整单重算、修订号递增与 JSON 原子落盘/重载（容器重建后可继续修订）
   diagnose.py   # 工作单换版诊断：开始时固定旧/新定义集指向，两侧各执行同一工作单，按内部精确数值/量纲/绝对温度属性逐步比较并定位首个含义变化
   migrate.py    # 工作单输入迁移：旧定义下执行后把初始变量改写为新定义下物理量相同的精确十进制值，复核整张新工作单并返回可直接交给 /worksheet 的结果
   units.py      # 单位注册表、SI 词头与别名
@@ -1150,9 +1337,10 @@ tests/
   test_worksheet.py # /worksheet 顺序工作单（引用规则/精确与温标传递/三来源/别名只解析一次）端到端测试
   test_worksheet_diagnose.py # /worksheet-diagnose 换版诊断（显示相同物理值已变/量纲与绝对温度/部分失败/别名固定/422）端到端测试
   test_worksheet_migrate.py # /worksheet-migrate 输入迁移（改写变量/往返提交/别名固定/各类 422 指出变量或步骤）端到端测试
+  test_revisable_worksheets.py # 可修订工作单创建/读取/修订（单项目替换/整单重算/下游不沿用旧结果/409 CAS/404/422/别名固定/重建后续修订/写盘回滚/一致读）端到端测试
   test_custom_units.py  # 请求级自定义单位（四个接口）端到端测试
   test_unit_sets.py     # 可复用定义集发布/选用/互斥/隔离/不可变/持久化测试
   test_unit_set_aliases.py  # 活动别名查询/切换（409/422）/四接口选用/并发一致性/持久化与旧文件兼容测试
 Dockerfile
-docker-compose.yml  # 命名卷 unit_sets_data -> /data，持久化已发布定义集与活动别名
+docker-compose.yml  # 命名卷 unit_sets_data -> /data，持久化已发布定义集、活动别名与可修订工作单
 ```

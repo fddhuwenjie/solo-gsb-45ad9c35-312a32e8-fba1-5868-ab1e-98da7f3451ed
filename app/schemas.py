@@ -355,6 +355,198 @@ class WorksheetResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# 可修订工作单（POST/GET/PATCH /revisable-worksheets）
+# ---------------------------------------------------------------------------
+
+
+class RevisableWorksheetCreateRequest(WorksheetBody):
+    """POST /revisable-worksheets 请求体：现有 2～5 步工作单 + 一份定义集引用。
+
+    与诊断/迁移请求一致：单位来源只接受**已发布**定义集的标识或活动别名
+    （请求级 ``custom_units`` 不参与持久化），二者恰好给出一个。别名在
+    创建开始时解析一次，保存的是解析到的具体标识——此后别名再切换也不
+    影响该工作单。
+    """
+
+    custom_unit_set_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="已发布定义集标识；与 custom_unit_set_alias 恰好给出一个；"
+        "不存在返回 422，不创建工作单",
+    )
+    custom_unit_set_alias: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=ALIAS_NAME_PATTERN,
+        description="已发布定义集的活动别名；创建开始时解析一次并固定实际指向，"
+        "此后别名再切换仍使用创建时的定义；与 custom_unit_set_id 恰好给出一个；"
+        "别名不存在返回 422，不创建工作单",
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_ref(self) -> "RevisableWorksheetCreateRequest":
+        if (self.custom_unit_set_id is None) == (self.custom_unit_set_alias is None):
+            raise ValueError(
+                "custom_unit_set_id 与 custom_unit_set_alias 必须恰好给出一个"
+            )
+        return self
+
+
+class VariableReplacement(BaseModel):
+    """修订指令：替换一个**现有**初始变量的值与单位（变量名不变）。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=32,
+        description="要替换的现有初始变量名；该变量不存在时整次修订返回 422",
+    )
+    value: Decimal = Field(
+        description="新的十进制定值（建议用字符串传递）；与单位一起整体替换"
+    )
+    unit: str = Field(
+        min_length=1, max_length=200, description="新的变量单位表达式"
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, name: str) -> str:
+        if not _VAR_NAME_RE.match(name):
+            raise ValueError(
+                f"变量名 {name!r} 不合法：须以字母或下划线开头，"
+                "仅含字母、数字、下划线，长度不超过 32"
+            )
+        return name
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _coerce_value(cls, v: Any) -> Any:
+        return _coerce_value(v)
+
+    @field_validator("value")
+    @classmethod
+    def _check_value(cls, d: Decimal) -> Decimal:
+        return _check_value(d)
+
+
+class StepReplacement(BaseModel):
+    """修订指令：按现有结果名替换一个步骤的公式/方程及目标单位。
+
+    替换内容的字段规则与 :class:`WorksheetStep` 完全一致（求值/反求恰好
+    一种、结果名词法合法、方程恰好一个等号等）；``name`` 只用于定位现有
+    步骤，步骤位置与名称保持不变，不能新增、删除或重命名步骤。步骤可以
+    在求值与反求两种形态之间替换，只要替换后整张工作单仍满足既有校验。
+    """
+
+    name: str = Field(
+        min_length=1,
+        max_length=32,
+        description="要替换的现有步骤结果名；该步骤不存在时整次修订返回 422；"
+        "步骤位置与名称保持不变",
+    )
+    output_unit: str = Field(
+        min_length=1, max_length=200, description="新的结果目标单位表达式"
+    )
+    formula: str | None = Field(
+        default=None, min_length=1, max_length=500, description="新的求值公式（求值步骤）"
+    )
+    equation: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        description="新的方程（反求步骤，恰好一个等号）",
+    )
+    solve_for: str | None = Field(
+        default=None, min_length=1, max_length=32, description="新的待解未知量名称（反求步骤）"
+    )
+
+    @model_validator(mode="after")
+    def _check_step_shape(self) -> "StepReplacement":
+        # 复用 WorksheetStep 的全部步骤级校验（两种步骤恰好一种、名称/未知量
+        # 词法、方程单等号等），保证替换内容与新建工作单同等严格；未提供的
+        # 可选字段以 None 传入，由 WorksheetStep 的“恰好一种步骤”规则判定
+        WorksheetStep(
+            name=self.name,
+            output_unit=self.output_unit,
+            formula=self.formula,
+            equation=self.equation,
+            solve_for=self.solve_for,
+        )
+        return self
+
+    def to_step(self) -> WorksheetStep:
+        """转换为可直接放入工作单本体的 :class:`WorksheetStep`。"""
+
+        return WorksheetStep(
+            name=self.name,
+            output_unit=self.output_unit,
+            formula=self.formula,
+            equation=self.equation,
+            solve_for=self.solve_for,
+        )
+
+
+class RevisableWorksheetPatchRequest(BaseModel):
+    """PATCH /revisable-worksheets/{id} 请求体：预期修订号 + 恰好一项修改。"""
+
+    expected_revision: int = Field(
+        ge=1,
+        description="调用方读取到的当前修订号；与服务端当前修订号不一致时"
+        "返回 409 且不做任何修改。初始修订号为 1，每次成功修订后 +1",
+    )
+    variable: VariableReplacement | None = Field(
+        default=None,
+        description="替换一个现有初始变量的值与单位；与 step 恰好给出一个",
+    )
+    step: StepReplacement | None = Field(
+        default=None,
+        description="按现有结果名替换一个步骤的公式/方程及目标单位（名称不变）；"
+        "与 variable 恰好给出一个",
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_change(self) -> "RevisableWorksheetPatchRequest":
+        if (self.variable is None) == (self.step is None):
+            raise ValueError(
+                "variable 与 step 必须恰好给出一个：一次修订只能替换一个初始"
+                "变量，或一个现有步骤"
+            )
+        return self
+
+
+class StoredVariable(BaseModel):
+    """读取/修订响应中的单个初始变量（值为精确十进制字符串）。"""
+
+    value: str = Field(description="变量的精确十进制值（字符串）")
+    unit: str = Field(description="变量单位表达式")
+
+
+class RevisableWorksheetResponse(BaseModel):
+    """可修订工作单当前修订的完整内容（创建/读取/修订成功均返回本模型）。"""
+
+    id: str = Field(description="服务生成的工作单标识（不可猜测）")
+    revision: int = Field(
+        description="当前修订号：创建成功为 1，每次成功修订递增 1；"
+        "steps 与 variables 必然同属这一修订"
+    )
+    custom_unit_set_id: str = Field(
+        description="创建时固定下来的实际定义集标识（即使创建时用的是别名，"
+        "这里也是解析到的标识；别名此后切换不影响本工作单）"
+    )
+    variables: dict[str, StoredVariable] = Field(
+        description="当前修订的初始变量（单位表达式 + 精确十进制值）"
+    )
+    steps: list[WorksheetStep] = Field(
+        description="当前修订的步骤定义（2～5 个，顺序与执行顺序一致）"
+    )
+    results: list[WorksheetStepResult] = Field(
+        description="当前修订在固定定义集下整单重算得到的逐步结果，"
+        "与 variables、steps 同属 revision 这一修订"
+    )
+
+
 class UnitSetRef(BaseModel):
     """诊断请求中一侧（旧/新）使用的已发布定义集引用。
 
